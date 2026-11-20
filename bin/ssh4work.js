@@ -49,7 +49,7 @@ if (args[0] === 'check-update') {
     } else {
       console.log('未能获取 Release 信息，尝试直接从主分支拉取更新...');
     }
-    const up = performAppUpgrade();
+    const up = performAppUpgrade({ inheritStdio: true });
     if (!up.ok) {
       console.error(`升级失败: ${up.error}`);
       process.exitCode = 1;

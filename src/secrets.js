@@ -81,8 +81,9 @@ export function createMacKeychainBackend(run = defaultRunner) {
       return available;
     },
     store(account, value) {
+      const safeAccount = String(account).replace(/["\\\r\n]/g, '_');
       const hex = Buffer.from(Buffer.from(value, 'utf8').toString('base64'), 'utf8').toString('hex');
-      run('security', ['-i'], `add-generic-password -U -s ${SECRET_SERVICE} -a ${account} -l ${SECRET_SERVICE} -X ${hex}\n`);
+      run('security', ['-i'], `add-generic-password -U -s ${SECRET_SERVICE} -a "${safeAccount}" -l ${SECRET_SERVICE} -X ${hex}\n`);
       // `security -i` does not propagate the sub-command status, so read the item back.
       const [check] = this.loadMany([{ account }]);
       if (check !== value) throw new Error('security add-generic-password failed');
@@ -112,6 +113,16 @@ const DPAPI_PS = (op) =>
     '[Console]::Out.Write(($out -join "`n"))',
   ].join('\n');
 
+const DPAPI_PROBE_PS = [
+  "$ErrorActionPreference = 'Stop'",
+  'Add-Type -AssemblyName System.Security',
+  '$scope = [System.Security.Cryptography.DataProtectionScope]::CurrentUser',
+  '$b = [Convert]::FromBase64String("cHJvYmU=")',
+  '$e = [System.Security.Cryptography.ProtectedData]::Protect($b, $null, $scope)',
+  '$u = [System.Security.Cryptography.ProtectedData]::Unprotect($e, $null, $scope)',
+  '[Console]::Out.Write([Convert]::ToBase64String($u))',
+].join('\n');
+
 /**
  * Windows: DPAPI bound to the current user. The returned ref *is* the ciphertext, so it is
  * stored in profiles.json; it can only be decrypted by the same Windows account.
@@ -130,9 +141,8 @@ export function createDpapiBackend(run = defaultRunner) {
     isAvailable() {
       if (available === null) {
         try {
-          const probe = Buffer.from('probe').toString('base64');
-          const [enc] = ps('Protect', [probe]);
-          available = Boolean(enc) && ps('Unprotect', [enc])[0] === probe;
+          const r = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', DPAPI_PROBE_PS], '');
+          available = r.status === 0 && r.stdout.trim() === 'cHJvYmU=';
         } catch {
           available = false;
         }

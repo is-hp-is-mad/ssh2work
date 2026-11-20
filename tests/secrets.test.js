@@ -152,7 +152,7 @@ test('macOS keychain backend stores base64 via `security -i` stdin and round-tri
   const items = new Map();
   const { run, calls } = recordingRunner({
     'security -i': (_args, input) => {
-      const m = input.match(/-a (\S+) .*-X ([0-9a-f]+)/);
+      const m = input.match(/-a "?([^"\s]+)"? .*-X ([0-9a-f]+)/);
       items.set(m[1], Buffer.from(m[2], 'hex').toString('utf8'));
       return { status: 0, stdout: '', stderr: '' };
     },
@@ -173,6 +173,9 @@ test('DPAPI backend batches decryption and keeps ciphertext as the ref', () => {
   const dec = (s) => Buffer.from(s, 'base64').toString().replace(/^ENC\((.*)\)$/, '$1');
   const { run, calls } = recordingRunner({
     'powershell.exe -NoProfile': (args, input) => {
+      if (args[3].includes('cHJvYmU=')) {
+        return { status: 0, stdout: 'cHJvYmU=', stderr: '' };
+      }
       const lines = input.split('\n').filter(Boolean);
       const op = args[3].includes('::Protect(') ? enc : dec;
       return { status: 0, stdout: lines.map(op).join('\n'), stderr: '' };

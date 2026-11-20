@@ -264,12 +264,22 @@ export class ConfigStore {
         // Written in plaintext by an older version and no keyring is reachable: leave it as
         // it was rather than silently deleting the user's credential, but say so.
         out[field] = value;
-        this.secretWarning =
-          '配置文件中仍有明文密码且系统密钥环不可用，无法迁移。请安装 secret-tool 或清空该密码';
+        const hint =
+          process.platform === 'win32'
+            ? '请检查 Windows PowerShell DPAPI 环境或清空该密码'
+            : process.platform === 'darwin'
+              ? '请检查 macOS 登录钥匙串是否已解锁或清空该密码'
+              : '请安装 secret-tool 或清空该密码';
+        this.secretWarning = `配置文件中仍有明文密码且系统密钥环不可用，无法迁移。${hint}`;
         continue;
       } else if (this.secretMode === 'auto') {
-        this.secretWarning =
-          '系统密钥环不可用，密码仅在本次运行期间保留 (未写入磁盘)。可安装 secret-tool 或设置 SSH4WORK_SECRET_STORE=plaintext';
+        const hint =
+          process.platform === 'win32'
+            ? '请检查 PowerShell DPAPI'
+            : process.platform === 'darwin'
+              ? '请检查 macOS 钥匙串'
+              : '可安装 secret-tool';
+        this.secretWarning = `系统密钥环不可用，密码仅在本次运行期间保留 (未写入磁盘)。${hint}或设置 SSH4WORK_SECRET_STORE=plaintext`;
       }
       this._persistedSecrets.set(key, { value, ref });
     }

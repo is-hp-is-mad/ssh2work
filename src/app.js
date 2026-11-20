@@ -62,7 +62,7 @@ import {
 import { ANSI, ScreenBuffer } from './tui/renderer.js';
 import { TerminalController } from './tui/terminal.js';
 import { VirtualTerminal } from './tui/vterm.js';
-import { checkForAppUpdate, getCurrentVersion, performAppUpgrade } from './updater.js';
+import { checkForAppUpdate, getCurrentVersion, performAppUpgradeAsync } from './updater.js';
 import { displayWidth, formatShortTime, padEndWidth, truncateToWidth } from './utils/text.js';
 
 function wrapTextToWidth(text, maxWidth) {
@@ -407,6 +407,7 @@ export class ClaudeVpsApp {
     this._running = false;
     clearTimeout(this._resizeTimer);
     clearTimeout(this._resizeRenderTimer);
+    clearTimeout(this._statusTimer);
     for (const t of this.serverTabs) {
       try {
         if (t.termSession?._renderTimer) clearTimeout(t.termSession._renderTimer);
@@ -422,9 +423,41 @@ export class ClaudeVpsApp {
     process.exit(0);
   }
 
-  setStatus(msg, isError = false) {
+  setStatus(msg, isError = false, { ttlMs } = {}) {
+    clearTimeout(this._statusTimer);
+    this._statusTimer = null;
     this.statusMsg = msg;
     this.statusIsError = isError;
+    if (msg && this._running) {
+      const delay = typeof ttlMs === 'number' ? ttlMs : isError ? 5000 : 3500;
+      if (delay > 0) {
+        this._statusTimer = setTimeout(() => {
+          this._statusTimer = null;
+          if (this.statusMsg === msg) {
+            this.statusMsg = '';
+            this.statusIsError = false;
+            this.render();
+          }
+        }, delay);
+        this._statusTimer.unref?.();
+      }
+    }
+  }
+
+  getDefaultStatusHint() {
+    if (this.tab === 'profiles') {
+      return '↑/↓ 选服务器 | → 快捷指令 | Enter 连接 | n新建 e编辑 d删除 | Shift+Tab/Esc 顶部栏 | ? 命令面板';
+    }
+    if (this.tab === 'files') {
+      return '↑/↓ 选择 | Enter 进入 | ← 上级 | Space 启动Claude | n新建目录 p收藏 | Shift+Tab/Esc 顶部栏';
+    }
+    if (this.tab === 'docker') {
+      return '↑/↓ 选择 | ←/→ 切子标签 | [/] 切服务器 | Enter 进Shell | l日志 s启 x停 r重启 | Shift+Tab 切区域';
+    }
+    if (this.isAgentTab()) {
+      return '↑/↓ 选择 | ←/→ 切子标签 | [/] 切服务器 | Enter 恢复 | v预览 t统计 /搜索 | Shift+Tab 切区域';
+    }
+    return 'Shift+Tab/Esc 切换焦点 | ? 命令面板 | Ctrl+C 退出';
   }
 
   // ==================== Navigation & Actions ====================
@@ -2257,7 +2290,9 @@ export class ClaudeVpsApp {
         await this.runQuickCommandItem(this.activeProfile, {
           kind: 'custom',
           name: '📊 Docker Stats',
-          command: this.isDirElevate() ? 'sudo docker stats' : 'docker stats',
+          command: wrapSudoInteractiveCommand('docker stats', this.activeProfile, {
+            elevate: this.isDirElevate(),
+          }),
         });
         return;
       case 'openPlugins':
@@ -2288,10 +2323,27 @@ export class ClaudeVpsApp {
         await this.openAppUpdateModal({ force: true });
         return;
       case 'runAppUpgrade': {
-        this.setStatus('正在升级 ssh4work，请稍候...');
-        this.render();
-        const up = performAppUpgrade();
+        if (this.modal?.type === 'appUpdate' && this.modal.upgrading) return;
+        this.loadingText = '⬇ 正在下载并升级 ssh4work...';
         if (this.modal?.type === 'appUpdate') {
+          this.modal.upgrading = true;
+          this.modal.upgradeStatus = '⬇ 正在从 GitHub 下载更新...';
+          this.modal.upgradeDoneMsg = '';
+        }
+        this.render();
+        const up = await performAppUpgradeAsync({
+          onProgress: (msg) => {
+            this.loadingText = msg;
+            if (this.modal?.type === 'appUpdate') {
+              this.modal.upgradeStatus = msg;
+            }
+            this.render();
+          },
+        });
+        this.loadingText = '';
+        if (this.modal?.type === 'appUpdate') {
+          this.modal.upgrading = false;
+          this.modal.upgradeStatus = '';
           if (up.ok) {
             this.modal.upgradeDoneMsg = `升级成功: v${up.previousVersion} -> v${up.newVersion} (${up.method})，请重启 ssh4work 以应用新版本。`;
             this.modal.info = {
@@ -2300,7 +2352,7 @@ export class ClaudeVpsApp {
               hasUpdate: false,
             };
             this.appUpdateInfo = this.modal.info;
-            this.setStatus(`升级成功: v${up.previousVersion} -> v${up.newVersion}，请重启 ssh4work`);
+            this.setStatus(`升级成功: v${up.previousVersion} -> v${up.newVersion}，请重启 ssh4work`, false, { ttlMs: 6000 });
           } else {
             this.setStatus(`升级失败: ${up.error}`, true);
           }
@@ -4037,18 +4089,25 @@ export class ClaudeVpsApp {
     }
     if (m.type === 'preview') {
       const maxS = Math.max(0, m.lines.length - 6);
+      const btns = this.getPreviewModalButtons(m);
+      if (typeof m.btnIdx !== 'number') m.btnIdx = 0;
       if (ev.name === 'up') m.scroll = Math.max(0, m.scroll - 1);
       else if (ev.name === 'down') m.scroll = Math.min(maxS, m.scroll + 1);
       else if (ev.name === 'home') m.scroll = 0;
       else if (ev.name === 'end') m.scroll = maxS;
       else if (ev.name === 'pageup') m.scroll = Math.max(0, m.scroll - 8);
       else if (ev.name === 'pagedown') m.scroll = Math.min(maxS, m.scroll + 8);
-      else if (m.promptMeta && ev.char === 'e') return this.dispatchAction('editAgentPromptModal');
+      else if (ev.name === 'left' || ev.name === 'shift-tab') {
+        m.btnIdx = (m.btnIdx - 1 + btns.length) % btns.length;
+      } else if (ev.name === 'right' || ev.name === 'tab') {
+        m.btnIdx = (m.btnIdx + 1) % btns.length;
+      } else if (m.promptMeta && ev.char === 'e') return this.dispatchAction('editAgentPromptModal');
       else if (m.promptMeta && ev.char === 't') return this.dispatchAction('editAgentPromptInTerminal');
-      else if (ev.name === 'enter' && !m.promptMeta && !m.title?.startsWith('🛠 Skill:')) {
-        return this.dispatchAction('previewResume');
-      }
-      else if (ev.char === 'q') {
+      else if (m.session && ev.char === 'r') return this.dispatchAction('previewResume');
+      else if (ev.name === 'enter' || ev.name === 'space') {
+        const picked = btns[Math.max(0, Math.min(btns.length - 1, m.btnIdx))];
+        if (picked) return this.dispatchAction(picked.action, picked.payload ?? null);
+      } else if (ev.char === 'q') {
         this.modal = null;
       }
       this.render();
@@ -4338,10 +4397,10 @@ export class ClaudeVpsApp {
         : scrollOff > 0
           ? `[${curTab?.profile?.name || 'SSH'}] 回看历史 (+${scrollOff} 行) - 滚轮向下或任意键返回底部`
           : curTab?.termSession?.exited
-            ? `[${curTab.profile?.name}] SSH 已退出 (${curTab.termSession.exitCode}) - 按 Enter 返回 | Alt+数字 切换`
+            ? `[${curTab.profile?.name}] SSH 已退出 (${curTab.termSession.exitCode}) - 按 Enter 返回 | Alt+1~9 离开终端切面板`
             : this.terminalMouseMode
-              ? `[${curTab?.profile?.name || 'SSH'}] 触控点击模式 - 点击顶部切换 | Alt+M 切回直接选字 | Ctrl+Q 退出`
-              : `[${curTab?.profile?.name || 'SSH'}] 原生选字(可直接拖拽) | Alt+数字切面板 | Alt+[/]切服务器 | Alt+V贴图 | Alt+M触控`;
+              ? `[${curTab?.profile?.name || 'SSH'}] 触控模式(可点顶部) | Alt+1~9离开终端切面板 | Alt+[/]切服务器 | Alt+M切回选字 | Ctrl+Q退出`
+              : `[${curTab?.profile?.name || 'SSH'}] 离开终端: Alt+1~9切面板 / Alt+[/]切服务器 | Alt+V贴图 | Alt+M触控 | Ctrl+Q退出`;
       scr.drawLine(rows, termStatus, this.statusIsError ? ANSI.fg.red : ANSI.fg.gray);
       if (this.modal) {
         this.renderModal(scr, cols, rows);
@@ -4372,7 +4431,7 @@ export class ClaudeVpsApp {
     scr.drawRule(rows - 2);
     this.renderActionBar(scr, rows - 1);
 
-    let statusText = this.loadingText || this.statusMsg || '';
+    let statusText = this.loadingText || this.statusMsg || this.getDefaultStatusHint();
     let statusStyle = this.loadingText
       ? `${ANSI.fg.brightYellow}${ANSI.bold}`
       : this.statusIsError
@@ -5145,6 +5204,20 @@ export class ClaudeVpsApp {
     }
   }
 
+  getPreviewModalButtons(m) {
+    const btns = [];
+    if (m.promptMeta) {
+      btns.push({ label: '✎ 写入/覆盖(e)', action: 'editAgentPromptModal', primary: true });
+      btns.push({ label: '💻 终端编辑(t)', action: 'editAgentPromptInTerminal' });
+    } else if (m.session && !m.title?.startsWith('🛠 Skill:')) {
+      btns.push({ label: '▶ 恢复此会话(Enter)', action: 'previewResume', primary: true });
+    }
+    btns.push({ label: '▲ 上翻', action: 'previewScrollUp' });
+    btns.push({ label: '▼ 下翻', action: 'previewScrollDown' });
+    btns.push({ label: '关闭(Esc)', action: 'modalCancel' });
+    return btns;
+  }
+
   getTokenStatsRows(m) {
     if (!m?.stats) return [];
     if (m.view === 'route') return m.stats.byRoute || [];
@@ -5312,16 +5385,23 @@ export class ClaudeVpsApp {
           { target: 'modal', hovered: this._sbHover === 'modal' || this._sbDrag?.target === 'modal' }
         );
       }
+      const pBtns = this.getPreviewModalButtons(m);
+      const focusBtnIdx = Math.max(0, Math.min(pBtns.length - 1, typeof m.btnIdx === 'number' ? m.btnIdx : 0));
       let bx = inner.x;
-      if (m.promptMeta) {
-        bx = scr.drawButton(bx, inner.y + inner.h - 1, '✎ 写入/覆盖', 'editAgentPromptModal', null, { primary: true });
-        bx = scr.drawButton(bx, inner.y + inner.h - 1, '💻 终端编辑', 'editAgentPromptInTerminal');
-      } else if (!m.title?.startsWith('🛠 Skill:')) {
-        bx = scr.drawButton(bx, inner.y + inner.h - 1, '▶ 恢复此会话', 'previewResume', null, { primary: true });
+      for (let bi = 0; bi < pBtns.length; bi++) {
+        const b = pBtns[bi];
+        const startBx = bx;
+        bx = scr.drawButton(bx, inner.y + inner.h - 1, b.label, b.action, b.payload ?? null, {
+          primary: b.primary,
+        });
+        if (bi === focusBtnIdx) {
+          scr.writeAt(startBx, inner.y + inner.h - 1, ` ${b.label} `, `\x1b[43m${ANSI.fg.black}${ANSI.bold}`);
+        }
       }
-      bx = scr.drawButton(bx, inner.y + inner.h - 1, '▲ 上翻', 'previewScrollUp');
-      bx = scr.drawButton(bx, inner.y + inner.h - 1, '▼ 下翻', 'previewScrollDown');
-      scr.drawButton(bx, inner.y + inner.h - 1, '关闭 (Esc)', 'modalCancel');
+      const pHint = ' ←/→选按钮 | ↑/↓滚动 | Enter触发';
+      if (bx + 4 < inner.x + inner.w) {
+        scr.writeAt(bx, inner.y + inner.h - 1, truncateToWidth(pHint, inner.x + inner.w - bx), ANSI.fg.gray);
+      }
     } else if (m.type === 'agentSkills') {
       const viewH = inner.h - 2;
       m.scroll = this.computeScroll(m.idx, m.scroll, viewH, m.skills.length);
@@ -5473,6 +5553,11 @@ export class ClaudeVpsApp {
       const contentH = inner.y + inner.h - 1 - contentStartY; // -1 for button row
       if (m.loading) {
         scr.writeAt(inner.x, contentStartY + 1, '⏳ 正在检查中...', ANSI.fg.brightYellow);
+      } else if (m.upgrading) {
+        const progLines = wrapTextToWidth(m.upgradeStatus || '⬇ 正在从 GitHub 下载更新...', inner.w - 2);
+        for (let i = 0; i < Math.min(progLines.length, contentH); i++) {
+          scr.writeAt(inner.x, contentStartY + 1 + i, progLines[i], `${ANSI.fg.brightYellow}${ANSI.bold}`);
+        }
       } else if (m.upgradeDoneMsg) {
         const wlines = wrapTextToWidth(m.upgradeDoneMsg, inner.w - 2);
         for (let i = 0; i < Math.min(wlines.length, contentH); i++) {

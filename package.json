@@ -1,6 +1,6 @@
 {
   "name": "ssh4work",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "description": "Zero-dependency, touch-friendly pure-SSH multi-server TUI workspace & remote AI coding agent manager (Claude Code, Codex, AGY, Pi, OpenCode) with in-memory image clipboard sync.",
   "type": "module",
   "author": "is-hp-is-mad",

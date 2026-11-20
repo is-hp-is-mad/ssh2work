@@ -696,45 +696,49 @@ test('Shift+Tab cycles top -> sub -> bottom -> content in plugin tabs and shows 
     ];
     app._running = true;
     app.term.getSize = () => ({ cols: 110, rows: 26 });
-    const origWrite = process.stdout.write;
-    process.stdout.write = () => true;
-    try {
-      app.render();
+    const origRender = app.render.bind(app);
+    app.render = () => {
+      const origWrite = process.stdout.write;
+      process.stdout.write = () => true;
+      try {
+        origRender();
+      } finally {
+        process.stdout.write = origWrite;
+      }
+    };
+    app.render();
 
-      // Verify 3 distinct button zones exist on Claude Code tab: top, sub, bottom
-      assert.ok(app.getZoneButtons(app._lastScreen, 'top').length > 0);
-      assert.ok(app.getZoneButtons(app._lastScreen, 'sub').length > 0);
-      assert.ok(app.getZoneButtons(app._lastScreen, 'bottom').length > 0);
+    // Verify 3 distinct button zones exist on Claude Code tab: top, sub, bottom
+    assert.ok(app.getZoneButtons(app._lastScreen, 'top').length > 0);
+    assert.ok(app.getZoneButtons(app._lastScreen, 'sub').length > 0);
+    assert.ok(app.getZoneButtons(app._lastScreen, 'bottom').length > 0);
 
-      // Cycle: content -> top -> sub -> bottom -> content
-      assert.equal(app.uiFocusZone, 'content');
-      await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
-      assert.equal(app.uiFocusZone, 'top');
+    // Cycle: content -> top -> sub -> bottom -> content
+    assert.equal(app.uiFocusZone, 'content');
+    await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
+    assert.equal(app.uiFocusZone, 'top');
 
-      // Move focus to the closeable server tab and verify status bar shows "长按 w 关闭标签"
-      const topBtns = app.getZoneButtons(app._lastScreen, 'top');
-      const tabBtnIdx = topBtns.findIndex((b) => b.action === 'switchServerTab');
-      assert.ok(tabBtnIdx >= 0);
-      app.uiFocusBtnIdx = tabBtnIdx;
-      app.render();
-      const statusRow = app._lastScreen.extractText(1, 26, 110, 26);
-      assert.ok(statusRow.includes('长按 w 关闭标签'), `expected close-tab hint in status bar, got: ${statusRow}`);
+    // Move focus to the closeable server tab and verify status bar shows "长按 w 关闭标签"
+    const topBtns = app.getZoneButtons(app._lastScreen, 'top');
+    const tabBtnIdx = topBtns.findIndex((b) => b.action === 'switchServerTab');
+    assert.ok(tabBtnIdx >= 0);
+    app.uiFocusBtnIdx = tabBtnIdx;
+    app.render();
+    const statusRow = app._lastScreen.extractText(1, 26, 110, 26);
+    assert.ok(statusRow.includes('长按 w 关闭标签'), `expected close-tab hint in status bar, got: ${statusRow}`);
 
-      // Continue cycling: top -> sub -> bottom -> content
-      await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
-      assert.equal(app.uiFocusZone, 'sub');
-      await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
-      assert.equal(app.uiFocusZone, 'bottom');
-      await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
-      assert.equal(app.uiFocusZone, 'content');
+    // Continue cycling: top -> sub -> bottom -> content
+    await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
+    assert.equal(app.uiFocusZone, 'sub');
+    await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
+    assert.equal(app.uiFocusZone, 'bottom');
+    await app.handleKey({ type: 'key', name: 'shift-tab', char: '', ctrl: false });
+    assert.equal(app.uiFocusZone, 'content');
 
-      // In content zone, down arrow navigates the plugin's session list
-      assert.equal(app.sessionIdx, 0);
-      await app.handleKey({ type: 'key', name: 'down', char: '', ctrl: false });
-      assert.equal(app.sessionIdx, 1);
-    } finally {
-      process.stdout.write = origWrite;
-    }
+    // In content zone, down arrow navigates the plugin's session list
+    assert.equal(app.sessionIdx, 0);
+    await app.handleKey({ type: 'key', name: 'down', char: '', ctrl: false });
+    assert.equal(app.sessionIdx, 1);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -813,6 +817,65 @@ test('tokenStats modal supports full keyboard navigation (views, time presets, c
     // 'q' closes tokenStats modal
     await app.handleKey({ type: 'key', name: 'q', char: 'q', ctrl: false });
     assert.equal(app.modal, null);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('preview modal supports pure-TUI button focus navigation and status toast auto-clears to default guide', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh4work-preview-toast-'));
+  try {
+    const app = new ClaudeVpsApp({ configPath: path.join(tmpDir, 'profiles.json') });
+    app._running = true;
+    app.term.getSize = () => ({ cols: 110, rows: 24 });
+    const origRender = app.render.bind(app);
+    app.render = () => {
+      const origWrite = process.stdout.write;
+      process.stdout.write = () => true;
+      try {
+        origRender();
+      } finally {
+        process.stdout.write = origWrite;
+      }
+    };
+    let resumedId = '';
+    app.resumeAgentSession = async (s) => {
+      resumedId = s?.sessionId || '';
+    };
+    app.modal = {
+      type: 'preview',
+      title: '会话内容预览',
+      session: { sessionId: 'sess-123', title: 'Test', cwd: '/app' },
+      agentType: 'claude',
+      lines: Array.from({ length: 20 }, (_, i) => ({ text: `line ${i}`, style: '' })),
+      scroll: 0,
+    };
+    app.render();
+
+    // Right moves focus from [▶ 恢复此会话(Enter)] -> [▲ 上翻] -> [▼ 下翻]
+    await app.handleKey({ type: 'key', name: 'right', char: '', ctrl: false });
+    assert.equal(app.modal.btnIdx, 1);
+    await app.handleKey({ type: 'key', name: 'right', char: '', ctrl: false });
+    assert.equal(app.modal.btnIdx, 2);
+    // Enter triggers previewScrollDown
+    await app.handleKey({ type: 'key', name: 'enter', char: '', ctrl: false });
+    assert.ok(app.modal.scroll > 0);
+
+    // Left twice returns focus to [▶ 恢复此会话(Enter)] and Enter resumes
+    await app.handleKey({ type: 'key', name: 'left', char: '', ctrl: false });
+    await app.handleKey({ type: 'key', name: 'left', char: '', ctrl: false });
+    assert.equal(app.modal.btnIdx, 0);
+    await app.handleKey({ type: 'key', name: 'enter', char: '', ctrl: false });
+    assert.equal(resumedId, 'sess-123');
+    assert.equal(app.modal, null);
+
+    // Temporary status toast auto-clears after ttlMs and restores default operation guide
+    app.setStatus('已推送剪贴板图片并触发粘贴 (Ctrl+V)', false, { ttlMs: 40 });
+    assert.equal(app.statusMsg, '已推送剪贴板图片并触发粘贴 (Ctrl+V)');
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(app.statusMsg, '');
+    const statusRow = app._lastScreen.extractText(1, 24, 110, 24);
+    assert.ok(statusRow.includes('Shift+Tab'), `expected default operation guide, got: ${statusRow}`);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
