@@ -1,5 +1,5 @@
 import { buildClipboardEnvAndTrap } from './clipboard.js';
-import { quoteSh, runRemote, wrapSudoCommand } from './ssh.js';
+import { quoteSh, runRemote, runRemoteElevated } from './ssh.js';
 
 /**
  * Validate a single directory name (no slashes, not . or ..).
@@ -79,9 +79,8 @@ export async function listRemoteDir(
   const flags = showHidden ? '-1ApL' : '-1pL';
   const fallbackFlags = showHidden ? '-1Ap' : '-1p';
   const rawCmd = `LC_ALL=C cd ${target} || exit 1; pwd; ls ${flags} 2>/dev/null || ls ${fallbackFlags} 2>/dev/null || true`;
-  const cmd = wrapSudoCommand(rawCmd, profile, { elevate });
   const timeoutMs = (Number(settings.sshTimeoutSec) || 20) * 1000;
-  const res = await runRemote(profile, cmd, { timeoutMs, settings });
+  const res = await runRemoteElevated(profile, rawCmd, { elevate, timeoutMs, settings });
   if (!res.ok) {
     const errText = res.stderr || '';
     if (/sudo:.*password|incorrect password|not in the sudoers/i.test(errText)) {
@@ -116,8 +115,7 @@ export async function createRemoteDir(profile, parentPath, name, { elevate = fal
   const err = validateDirName(name);
   if (err) return { ok: false, error: err };
   const full = `${parentPath.replace(/\/+$/, '')}/${name.trim()}`;
-  const cmd = wrapSudoCommand(`mkdir -- ${quoteSh(full)}`, profile, { elevate });
-  const res = await runRemote(profile, cmd);
+  const res = await runRemoteElevated(profile, `mkdir -- ${quoteSh(full)}`, { elevate });
   return { ok: res.ok, fullPath: full, error: res.stderr || '' };
 }
 
@@ -138,9 +136,8 @@ export async function renameRemoteDir(
   const oldSh = quoteSh(`${base}/${oldName}`);
   const dstSh = quoteSh(`${base}/${newName.trim()}`);
   const rawCmd = `if [ -e ${dstSh} ]; then echo exists >&2; exit 1; fi; mv -- ${oldSh} ${dstSh}`;
-  const cmd = wrapSudoCommand(rawCmd, profile, { elevate });
   const timeoutMs = (Number(settings.sshTimeoutSec) || 20) * 1000;
-  const res = await runRemote(profile, cmd, { timeoutMs, settings });
+  const res = await runRemoteElevated(profile, rawCmd, { elevate, timeoutMs, settings });
   if (!res.ok && res.stderr.includes('exists')) {
     return { ok: false, error: `已存在同名项目: ${newName.trim()}` };
   }

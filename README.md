@@ -42,7 +42,7 @@
   - 支持保存多台 VPS 连接配置（主机、端口、用户、私钥路径、可选密码登录、`ProxyJump -J` 跳板机、额外 SSH 参数、前置环境命令 `preCommand`、自定义快捷指令）。
   - 支持从本机 `~/.ssh/config` 一键解析并导入已有 Host。
   - **私钥智能扫描与剪贴板一键落盘**：自动扫描项目目录内的私钥候选文件供下拉选择；支持直接从系统剪贴板粘贴私钥文本，自动规范化为 LF 换行并收紧文件权限（POSIX `chmod 600` / Windows `icacls` 仅当前用户可读）。
-  - **灵活的特权模式（Privilege Mode）**：支持每台服务器配置 `none`、`sudo`（支持免密 `sudo -n` 或自动填充提权密码 `sudo -S`）与 `root` 直连模式，远程目录浏览支持一键切换 `[sudo 提权]`。
+  - **灵活的特权模式（Privilege Mode）**：支持每台服务器配置 `none`、`sudo`（支持免密 `sudo -n` 或自动填充提权密码：非交互命令经 SSH 标准输入传递，交互终端由 TUI 应答 sudo 提示，密码不会出现在本地或远端的进程命令行中）与 `root` 直连模式，远程目录浏览支持一键切换 `[sudo 提权]`。
 - **🗂️ 远程目录浏览与快捷指令工作流**
   - 可视化浏览远程文件系统、新建/重命名文件夹、显隐隐藏目录、路径跳转、收藏常用工作目录（`★`）并自动记忆每台服务器上次访问的位置。
   - 支持为每台服务器配置专属**快捷指令（Quick Commands）**（如 `docker ps`、`htop`、启动开发服务等），支持横屏双栏与竖屏自适应布局。
@@ -147,6 +147,7 @@ ssh4work/
 │   ├── remote.js              # 远程目录操作及纯内存 stdin 注入的 Python 探针 (会话检索/预览/Token统计/MCP/Skills/Memory)
 │   ├── clipboard.js           # 纯 SSH 内存图片剪贴板同步引擎 (/dev/shm + xclip/wl-paste 内存垫片)、跨平台文本剪贴板与私钥扫描落盘
 │   ├── config.js              # 配置持久化管理 (~/.ssh4work/profiles.json) 与本机 ~/.ssh/config 解析器
+│   ├── secrets.js             # 系统凭据库存取 (secret-tool / macOS 钥匙串 / Windows DPAPI)，密码不落盘明文
 │   ├── plugins.js             # 插件管理器 (内置/远端源实时发现与更新/本地安装) 与 Token 计费分析引擎
 │   ├── updater.js             # GitHub Release 版本检测与 CLI / 界面内一键升级模块
 │   ├── tui/
@@ -160,6 +161,7 @@ ssh4work/
 ├── tests/
 │   ├── app.test.js            # 应用核心流程、多标签切换、插件系统、特权模式与 Token 统计单元测试
 │   ├── config.test.js         # 配置存储 CRUD 与 ~/.ssh/config 解析测试
+│   ├── secrets.test.js        # 凭据库后端、明文迁移与 sudo 密码不进入命令行测试
 │   ├── mouse.test.js          # SGR 鼠标/触控事件解析、ScreenBuffer Diff 渲染与 VirtualTerminal 仿真测试
 │   ├── platform.test.js       # Windows / Linux / macOS 跨平台适配单元测试
 │   ├── remote.test.js         # SSH 命令构建、内存剪贴板垫片生成与私钥权限规范化测试
@@ -351,8 +353,15 @@ npm test
 ## 配置与私钥安全说明
 
 1. **个人配置文件默认存储在用户主目录外**：
-   - 默认情况下，所有的服务器列表、密码与偏好设置均保存在您本机用户主目录下的 `~/.ssh4work/profiles.json`（兼容旧版 `~/.claude-vps/profiles.json`）中，**不在代码仓库目录内**。
-2. **仓库内置严格的 `.gitignore` 防护**：
+   - 默认情况下，服务器列表与偏好设置保存在您本机用户主目录下的 `~/.ssh4work/profiles.json`（兼容旧版 `~/.claude-vps/profiles.json`）中，**不在代码仓库目录内**。
+2. **SSH 登录密码与 sudo 提权密码保存在系统凭据库中，不以明文写入配置文件**：
+   - Linux / BSD：freedesktop Secret Service（GNOME Keyring / KWallet，经 `secret-tool`，需安装 `libsecret-tools` 等对应包）。
+   - macOS：登录钥匙串（`security`）。
+   - Windows：DPAPI（仅当前 Windows 用户可解密，密文保存在 `profiles.json` 中）。
+   - 写入/读取凭据时密码只经子进程标准输入传递，不出现在命令行参数中。
+   - 旧版本写入的明文密码会在首次启动时自动迁移到系统凭据库；若凭据库不可用，则保持原样并在状态栏提示。
+   - 若系统凭据库不可用（如无桌面会话的 Linux、Termux），新输入的密码仅在本次运行期间保留在内存中。可通过环境变量 `SSH4WORK_SECRET_STORE` 调整：`auto`（默认）、`memory`（从不落盘）、`plaintext`（旧版行为，明文写入配置文件，不推荐）。
+3. **仓库内置严格的 `.gitignore` 防护**：
    - `.gitignore` 已默认屏蔽 `keys/`、`*.pem`、`*.key`、`*.ppk`、`id_rsa*`、`id_ed25519*`、`.ssh4work/`、`.claude-vps/`、`profiles.json`、`*.local.json` 与 `.env*`。
    - 即使您将私钥文件存放在项目根目录或 `keys/` 文件夹下以便下拉选择，Git 也会自动忽略它们，防止误提交泄露。
    - **开源/提交前安全自检建议**：在执行 `git add` 与 `git commit` 前，建议始终运行 `git status` 确认暂存区中不包含任何私钥或个人配置。

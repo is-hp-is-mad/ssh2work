@@ -1,4 +1,4 @@
-import { quoteSh, runRemote, wrapSudoCommand } from './ssh.js';
+import { quoteSh, runRemoteElevated, wrapSudoInteractiveCommand } from './ssh.js';
 
 function parseJsonLines(text) {
   const out = [];
@@ -41,9 +41,8 @@ export async function fetchDockerOverview(profile, settings = {}, { elevate = fa
     'echo "===END==="',
   ].join('; ');
 
-  const cmd = wrapSudoCommand(rawCmd, profile, { elevate });
   const timeoutMs = Math.max(15000, (Number(settings.sshTimeoutSec) || 20) * 1000);
-  const res = await runRemote(profile, cmd, { timeoutMs, settings });
+  const res = await runRemoteElevated(profile, rawCmd, { elevate, timeoutMs, settings });
   if (!res.ok) {
     return {
       ok: false,
@@ -190,12 +189,11 @@ export async function runDockerAction(
       return { ok: false, error: `未知 Docker 操作: ${action}` };
   }
 
-  const cmd = wrapSudoCommand(rawCmd, profile, { elevate });
   const timeoutMs =
     action === 'pull' || action === 'composeUp'
       ? Math.max(60000, (Number(settings.sshTimeoutSec) || 20) * 3000)
       : Math.max(20000, (Number(settings.sshTimeoutSec) || 20) * 1000);
-  const res = await runRemote(profile, cmd, { timeoutMs, settings });
+  const res = await runRemoteElevated(profile, rawCmd, { elevate, timeoutMs, settings });
   return {
     ok: res.ok,
     stdout: res.stdout.trim(),
@@ -213,9 +211,8 @@ export async function fetchDockerLogs(
 ) {
   const n = Math.max(20, Math.min(2000, Number(tail) || 200));
   const rawCmd = `docker logs --tail ${n} ${quoteSh(containerId)} 2>&1`;
-  const cmd = wrapSudoCommand(rawCmd, profile, { elevate });
   const timeoutMs = Math.max(15000, (Number(settings.sshTimeoutSec) || 20) * 1000);
-  const res = await runRemote(profile, cmd, { timeoutMs, settings });
+  const res = await runRemoteElevated(profile, rawCmd, { elevate, timeoutMs, settings });
   return { ok: res.ok, text: res.stdout || '', error: res.stderr || '' };
 }
 
@@ -228,9 +225,8 @@ export async function fetchDockerInspect(
   { settings = {}, elevate = false } = {}
 ) {
   const rawCmd = `docker inspect ${quoteSh(containerId)}`;
-  const cmd = wrapSudoCommand(rawCmd, profile, { elevate });
   const timeoutMs = Math.max(15000, (Number(settings.sshTimeoutSec) || 20) * 1000);
-  const res = await runRemote(profile, cmd, { timeoutMs, settings });
+  const res = await runRemoteElevated(profile, rawCmd, { elevate, timeoutMs, settings });
   if (!res.ok) return { ok: false, text: '', error: res.stderr || '获取详情失败' };
   try {
     const arr = JSON.parse(res.stdout);
@@ -274,7 +270,7 @@ export async function fetchDockerInspect(
 export function buildDockerExecCommand(containerId, profile, { elevate = false } = {}) {
   const q = quoteSh(containerId);
   const inner = `docker exec -it ${q} /bin/bash 2>/dev/null || docker exec -it ${q} /bin/sh`;
-  return wrapSudoCommand(inner, profile, { elevate });
+  return wrapSudoInteractiveCommand(inner, profile, { elevate });
 }
 
 /**
@@ -282,5 +278,5 @@ export function buildDockerExecCommand(containerId, profile, { elevate = false }
  */
 export function buildDockerLogsFollowCommand(containerId, profile, { elevate = false, tail = 100 } = {}) {
   const inner = `docker logs -f --tail ${Number(tail) || 100} ${quoteSh(containerId)}`;
-  return wrapSudoCommand(inner, profile, { elevate });
+  return wrapSudoInteractiveCommand(inner, profile, { elevate });
 }

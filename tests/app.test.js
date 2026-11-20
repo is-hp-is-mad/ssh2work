@@ -12,7 +12,7 @@ import {
   formatLocalDateTimeNow,
   formatTokenCount,
 } from '../src/plugins.js';
-import { buildSshArgs, buildSshSpawnEnv, wrapSudoCommand } from '../src/ssh.js';
+import { buildSshArgs, buildSshSpawnEnv, sudoStdinData, wrapSudoCommand } from '../src/ssh.js';
 import { ScreenBuffer } from '../src/tui/renderer.js';
 import { parseInputEvents } from '../src/tui/terminal.js';
 import { VirtualTerminal } from '../src/tui/vterm.js';
@@ -479,7 +479,12 @@ test('privilegeMode supports root SSH target and sudo command elevation with or 
   });
   const pwCmd = wrapSudoCommand('ls /root', pwProfile, { elevate: true });
   assert.ok(pwCmd.includes('sudo -S -p'));
-  assert.ok(pwCmd.includes("'secret!'"));
+  // The password must never be part of the command line (visible via ps / /proc).
+  assert.ok(!pwCmd.includes('secret!'));
+  assert.ok(pwCmd.includes('exec </dev/null'));
+  assert.equal(sudoStdinData(pwProfile, { elevate: true }), 'secret!\n');
+  assert.equal(sudoStdinData(pwProfile), null);
+  assert.equal(sudoStdinData(nopassProfile), null);
 });
 
 test('per-server disabledPlugins skips disabled servers in Claude Code tab and quick commands', async () => {

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { ClaudeVpsApp } from '../src/app.js';
 import { buildDockerExecCommand, buildDockerLogsFollowCommand } from '../src/docker.js';
 import { ScreenBuffer } from '../src/tui/renderer.js';
+import { SUDO_PROMPT_MARKER } from '../src/ssh.js';
 
 test('buildDockerExecCommand and buildDockerLogsFollowCommand handle quoting and sudo', () => {
   const normal = buildDockerExecCommand('web-app', { privilegeMode: 'none' });
@@ -13,7 +14,8 @@ test('buildDockerExecCommand and buildDockerLogsFollowCommand handle quoting and
   assert.ok(normal.includes("docker exec -it 'web-app' /bin/sh"));
 
   const elevated = buildDockerLogsFollowCommand('api', { privilegeMode: 'sudo', sudoPassword: 'pw' }, { tail: 50 });
-  assert.ok(elevated.includes('sudo -S'));
+  assert.ok(elevated.includes(`sudo -p '${SUDO_PROMPT_MARKER}'`));
+  assert.ok(!/'pw'|printf/.test(elevated));
   assert.ok(elevated.includes('docker logs -f --tail 50'));
   assert.ok(elevated.includes('api'));
 });

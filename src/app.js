@@ -43,7 +43,14 @@ import {
   saveClaudeMemory,
   upsertAgentMcp,
 } from './remote.js';
-import { checkSshEnvironment, launchInteractiveSsh, quoteSh, spawnEmbeddedSsh } from './ssh.js';
+import {
+  checkSshEnvironment,
+  createSudoPromptFilter,
+  launchInteractiveSsh,
+  quoteSh,
+  spawnEmbeddedSsh,
+  wrapSudoInteractiveCommand,
+} from './ssh.js';
 import {
   aggregateTokenStats,
   fetchRemotePluginRegistry,
@@ -288,6 +295,7 @@ export class ClaudeVpsApp {
 
   start() {
     this.store.load();
+    if (this.store.secretWarning) this.setStatus(this.store.secretWarning, true);
     this.showHidden = this.store.getSettings().showHiddenByDefault;
     const profiles = this.store.list();
     if (this.store.data.activeProfileId) {
@@ -1249,9 +1257,7 @@ export class ClaudeVpsApp {
       const wantElevate = Boolean(item.root || profile.privilegeMode === 'sudo') && profile.privilegeMode !== 'root';
       if (wantElevate) {
         const innerShell = `${cdPrefix}exec ${shellExpr} -l`;
-        const sudoCmd = profile.sudoPassword
-          ? `printf '%s\\n' ${quoteSh(profile.sudoPassword)} | sudo -S -p '' -v && sudo sh -c ${quoteSh(innerShell)}`
-          : `sudo sh -c ${quoteSh(innerShell)}`;
+        const sudoCmd = wrapSudoInteractiveCommand(innerShell, profile, { elevate: true });
         remoteCmd = `${buildClipboardEnvAndTrap(clipboardToken)}; ${motdPrefix}${sudoCmd}`;
       } else {
         remoteCmd = `${buildClipboardEnvAndTrap(clipboardToken)}; ${motdPrefix}${cdPrefix}${shellExpr} -l`;
@@ -1328,8 +1334,15 @@ export class ClaudeVpsApp {
       }, delay);
     };
 
+    // Answer our own sudo prompt with the stored password via the PTY (never via argv).
+    const sudoFilter = createSudoPromptFilter(
+      () => this.store.getById(profile.id)?.sudoPassword || profile.sudoPassword,
+      (data) => {
+        if (proc?.stdin?.writable) proc.stdin.write(data);
+      }
+    );
     proc.stdout?.on('data', (chunk) => {
-      vterm.write(chunk);
+      vterm.write(sudoFilter(chunk));
       scheduleRender();
     });
     proc.stderr?.on('data', (chunk) => {
@@ -3515,7 +3528,8 @@ export class ClaudeVpsApp {
       const idx = this.store.list().findIndex((p) => p.id === saved.id);
       if (idx >= 0) this.profileIdx = idx;
       this.modal = null;
-      this.setStatus(`已保存服务器: ${saved.name}`);
+      if (this.store.secretWarning) this.setStatus(`已保存服务器: ${saved.name} - ${this.store.secretWarning}`, true);
+      else this.setStatus(`已保存服务器: ${saved.name}`);
       this.render();
       return;
     }

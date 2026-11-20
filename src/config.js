@@ -2,6 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {
+  SECRET_FIELDS,
+  createDefaultSecretBackend,
+  getSecretStoreMode,
+  secretAccount,
+} from './secrets.js';
 
 export const DEFAULT_PLUGIN_REGISTRY_URL = 'https://github.com/is-hp-is-mad/ssh4work-plugins';
 
@@ -85,8 +91,19 @@ export function createProfile(input = {}) {
 }
 
 export class ConfigStore {
-  constructor(filePath = getDefaultConfigPath()) {
+  /**
+   * @param {string} filePath
+   * @param {{ secretBackend?: object, secretMode?: 'auto'|'memory'|'plaintext' }} [opts]
+   *   Passwords (SSH login / sudo) are kept in the OS credential store, never in profiles.json,
+   *   unless secretMode is 'plaintext' (SSH4WORK_SECRET_STORE=plaintext).
+   */
+  constructor(filePath = getDefaultConfigPath(), { secretBackend = null, secretMode = getSecretStoreMode() } = {}) {
     this.filePath = filePath;
+    this.secretMode = secretMode;
+    this._secretBackend = secretBackend;
+    // `${profileId}:${field}` -> { value, ref, unresolved? } as last written to the backend.
+    this._persistedSecrets = new Map();
+    this.secretWarning = '';
     this.data = {
       version: 1,
       activeProfileId: null,
@@ -103,9 +120,11 @@ export class ConfigStore {
       }
       const raw = fs.readFileSync(this.filePath, 'utf8');
       const parsed = JSON.parse(raw);
-      const profiles = Array.isArray(parsed.profiles)
-        ? parsed.profiles.map((p) => createProfile(p))
-        : [];
+      const rawProfiles = Array.isArray(parsed.profiles) ? parsed.profiles : [];
+      const profiles = rawProfiles.map((p) => createProfile(p));
+      this._persistedSecrets.clear();
+      this.secretWarning = '';
+      const legacyPlaintext = this._loadSecrets(rawProfiles, profiles);
       const rawPlugins = parsed.plugins && typeof parsed.plugins === 'object' ? parsed.plugins : {};
       this.data = {
         version: 1,
@@ -118,6 +137,16 @@ export class ConfigStore {
         },
         profiles,
       };
+      if (legacyPlaintext && this.secretMode === 'auto' && this._backend().isAvailable()) {
+        // Migrate passwords written by older versions into the OS credential store.
+        const loadWarning = this.secretWarning;
+        try {
+          this.save();
+        } catch {
+          // Keep the loaded profiles; migration is retried on the next save.
+        }
+        if (!this.secretWarning) this.secretWarning = loadWarning;
+      }
     } catch {
       this.data = {
         version: 1,
@@ -130,11 +159,147 @@ export class ConfigStore {
     return this.data;
   }
 
+  _backend() {
+    if (!this._secretBackend) this._secretBackend = createDefaultSecretBackend();
+    return this._secretBackend;
+  }
+
+  /**
+   * Resolve password fields for freshly parsed profiles. Returns true when the file still
+   * contains legacy plaintext passwords.
+   */
+  _loadSecrets(rawProfiles, profiles) {
+    let legacyPlaintext = false;
+    const pending = [];
+    rawProfiles.forEach((raw, i) => {
+      const profile = profiles[i];
+      const refs = raw && typeof raw.secretRefs === 'object' && raw.secretRefs ? raw.secretRefs : {};
+      for (const field of SECRET_FIELDS) {
+        if (profile[field]) {
+          legacyPlaintext = true;
+          this._persistedSecrets.set(secretAccount(profile.id, field), {
+            value: profile[field],
+            ref: null,
+            legacy: true,
+          });
+          continue;
+        }
+        const ref = typeof refs[field] === 'string' ? refs[field] : '';
+        if (ref) pending.push({ profile, field, ref, account: secretAccount(profile.id, field) });
+      }
+    });
+    if (!pending.length) return legacyPlaintext;
+
+    let values = pending.map(() => null);
+    try {
+      if (this._backend().isAvailable()) values = this._backend().loadMany(pending);
+    } catch {
+      // Fall through: treated as unresolved below.
+    }
+    let missing = 0;
+    pending.forEach((entry, k) => {
+      const key = secretAccount(entry.profile.id, entry.field);
+      const value = values[k];
+      if (typeof value === 'string' && value) {
+        entry.profile[entry.field] = value;
+        this._persistedSecrets.set(key, { value, ref: entry.ref });
+      } else {
+        // Keep the reference so a temporarily locked/unreachable keyring does not lose it.
+        this._persistedSecrets.set(key, { value: '', ref: entry.ref, unresolved: true });
+        missing += 1;
+      }
+    });
+    if (missing) {
+      this.secretWarning = `无法从系统密钥环读取 ${missing} 个已保存的密码，请检查密钥环是否已解锁`;
+    }
+    return legacyPlaintext;
+  }
+
+  /**
+   * Persist password fields to the secret backend and return the on-disk profile copy.
+   */
+  _serializeProfile(profile, liveKeys) {
+    const out = { ...profile };
+    const refs = {};
+    for (const field of SECRET_FIELDS) {
+      const value = String(profile[field] || '');
+      const key = secretAccount(profile.id, field);
+      const prev = this._persistedSecrets.get(key);
+      liveKeys.add(key);
+      delete out[field];
+
+      if (this.secretMode === 'plaintext') {
+        if (value) out[field] = value;
+        else if (prev?.unresolved) refs[field] = prev.ref;
+        continue;
+      }
+      if (!value) {
+        if (prev?.unresolved) {
+          refs[field] = prev.ref;
+        } else if (prev?.ref) {
+          try {
+            this._backend().remove(key, prev.ref);
+          } catch {
+            // Best effort
+          }
+          this._persistedSecrets.delete(key);
+        }
+        continue;
+      }
+      if (prev && prev.value === value && !prev.legacy) {
+        if (prev.ref) refs[field] = prev.ref;
+        continue;
+      }
+      let ref = null;
+      if (this.secretMode === 'auto') {
+        try {
+          if (this._backend().isAvailable()) ref = this._backend().store(key, value);
+        } catch {
+          ref = null;
+        }
+      }
+      if (ref) {
+        refs[field] = ref;
+      } else if (prev?.legacy && prev.value === value && this.secretMode === 'auto') {
+        // Written in plaintext by an older version and no keyring is reachable: leave it as
+        // it was rather than silently deleting the user's credential, but say so.
+        out[field] = value;
+        this.secretWarning =
+          '配置文件中仍有明文密码且系统密钥环不可用，无法迁移。请安装 secret-tool 或清空该密码';
+        continue;
+      } else if (this.secretMode === 'auto') {
+        this.secretWarning =
+          '系统密钥环不可用，密码仅在本次运行期间保留 (未写入磁盘)。可安装 secret-tool 或设置 SSH4WORK_SECRET_STORE=plaintext';
+      }
+      this._persistedSecrets.set(key, { value, ref });
+    }
+    if (Object.keys(refs).length) out.secretRefs = refs;
+    return out;
+  }
+
   save() {
     const dir = path.dirname(this.filePath);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const tmp = `${this.filePath}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2), { encoding: 'utf8', mode: 0o600 });
+    const liveKeys = new Set();
+    this.secretWarning = '';
+    const onDisk = {
+      ...this.data,
+      profiles: this.data.profiles.map((p) => this._serializeProfile(p, liveKeys)),
+    };
+    for (const [key, entry] of [...this._persistedSecrets]) {
+      if (liveKeys.has(key)) continue;
+      // Profile was deleted: drop its credentials as well.
+      if (entry.ref && this.secretMode !== 'plaintext') {
+        try {
+          this._backend().remove(key, entry.ref);
+        } catch {
+          // Best effort
+        }
+      }
+      this._persistedSecrets.delete(key);
+    }
+    fs.writeFileSync(tmp, JSON.stringify(onDisk, null, 2), { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, this.filePath);
     if (process.platform !== 'win32') {
       try {

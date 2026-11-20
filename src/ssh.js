@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,15 +29,96 @@ export function getEffectiveSshUser(profile) {
   return String(profile?.user || '').trim();
 }
 
-export function wrapSudoCommand(innerCmd, profile, { elevate = false } = {}) {
+function needsElevation(profile, elevate) {
   const mode = profile?.privilegeMode || 'none';
-  if (mode === 'root') return innerCmd;
-  if (!elevate && mode !== 'sudo') return innerCmd;
-  const pw = String(profile?.sudoPassword || '');
-  if (pw) {
-    return `printf '%s\\n' ${quoteSh(pw)} | sudo -S -p '' sh -c ${quoteSh(innerCmd)}`;
+  if (mode === 'root') return false;
+  return Boolean(elevate) || mode === 'sudo';
+}
+
+/**
+ * Wrap a non-interactive command with sudo.
+ *
+ * The sudo password is never embedded in the command line (which would be visible in `ps`
+ * on both the local and the remote host). When one is configured, sudo reads it from the
+ * SSH channel's stdin (`sudo -S`); use {@link runRemoteElevated}, or pass
+ * {@link sudoStdinData} as `stdinData` to {@link runRemote}. The inner command gets
+ * /dev/null as stdin so an unconsumed password line can never reach it.
+ */
+export function wrapSudoCommand(innerCmd, profile, { elevate = false } = {}) {
+  if (!needsElevation(profile, elevate)) return innerCmd;
+  if (profile?.sudoPassword) {
+    return `sudo -S -p '' sh -c ${quoteSh(`exec </dev/null; ${innerCmd}`)}`;
   }
   return `sudo -n sh -c ${quoteSh(innerCmd)}`;
+}
+
+/**
+ * stdin payload that accompanies {@link wrapSudoCommand}, or null when none is needed.
+ */
+export function sudoStdinData(profile, { elevate = false } = {}) {
+  if (!needsElevation(profile, elevate) || !profile?.sudoPassword) return null;
+  return `${profile.sudoPassword}\n`;
+}
+
+/**
+ * Run a command over SSH, elevated with sudo when required by the profile / `elevate`.
+ */
+export function runRemoteElevated(profile, innerCmd, { elevate = false, ...opts } = {}) {
+  const cmd = wrapSudoCommand(innerCmd, profile, { elevate });
+  const stdinData = sudoStdinData(profile, { elevate });
+  return runRemote(profile, cmd, stdinData === null ? opts : { ...opts, stdinData });
+}
+
+/**
+ * Prompt string used for sudo inside embedded PTY sessions. It is unique per process so
+ * the embedded terminal can recognise *our* prompt and answer it with the stored password
+ * (see {@link createSudoPromptFilter}) without the password ever touching argv.
+ */
+export const SUDO_PROMPT_MARKER = `<<ssh4work-sudo-${crypto.randomBytes(6).toString('hex')}>>`;
+
+/**
+ * Wrap a command for an interactive (PTY) session with sudo. sudo prompts on the remote
+ * TTY with echo disabled; the embedded terminal fills in the stored password if there is
+ * one, otherwise the user can type it.
+ */
+export function wrapSudoInteractiveCommand(innerCmd, profile, { elevate = false } = {}) {
+  if (!needsElevation(profile, elevate)) return innerCmd;
+  return `sudo -p ${quoteSh(SUDO_PROMPT_MARKER)} sh -c ${quoteSh(innerCmd)}`;
+}
+
+/**
+ * Create a stream filter for embedded-terminal output that replaces our sudo prompt marker
+ * with a readable prompt and answers the first occurrence with the stored password.
+ * Returns `(chunk: Buffer) => Buffer`.
+ */
+export function createSudoPromptFilter(getPassword, writeToRemote, { marker = SUDO_PROMPT_MARKER } = {}) {
+  const needle = Buffer.from(marker, 'utf8');
+  let carry = Buffer.alloc(0);
+  let answered = false;
+  return (chunk) => {
+    let buf = carry.length ? Buffer.concat([carry, Buffer.from(chunk)]) : Buffer.from(chunk);
+    carry = Buffer.alloc(0);
+    const out = [];
+    let idx;
+    while ((idx = buf.indexOf(needle)) !== -1) {
+      out.push(buf.subarray(0, idx));
+      const pw = answered ? '' : String(getPassword() || '');
+      if (pw) {
+        answered = true;
+        writeToRemote(`${pw}\n`);
+        out.push(Buffer.from('[sudo] password: (ssh4work 已自动填充)'));
+      } else {
+        out.push(Buffer.from('[sudo] password: '));
+      }
+      buf = buf.subarray(idx + needle.length);
+    }
+    // Hold back a trailing partial match so a marker split across chunks is still caught.
+    let keep = Math.min(needle.length - 1, buf.length);
+    while (keep > 0 && !needle.subarray(0, keep).equals(buf.subarray(buf.length - keep))) keep -= 1;
+    out.push(buf.subarray(0, buf.length - keep));
+    carry = Buffer.from(buf.subarray(buf.length - keep));
+    return Buffer.concat(out);
+  };
 }
 
 /**
